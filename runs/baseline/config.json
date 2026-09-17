@@ -1,0 +1,22 @@
+{
+  "arm": "baseline",
+  "evaluator": "weak",
+  "reg": "none",
+  "policy": "runs/sft/final",
+  "judge": "Qwen/Qwen2.5-1.5B-Instruct",
+  "data": "data",
+  "out": "runs/baseline",
+  "steps": 300,
+  "lr": 1e-05,
+  "num_generations": 8,
+  "batch": 64,
+  "temperature": 1.2,
+  "max_completion": 64,
+  "seed": 0,
+  "gr_strength": 0.0001,
+  "gr_eps": 0.001,
+  "kl_beta": 0.04,
+  "eval_every": 25,
+  "eval_n": 100,
+  "lora": false
+}
