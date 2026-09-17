@@ -31,8 +31,11 @@ class HeldOutEvalCallback(TrainerCallback):
     def __init__(self, test_tasks, customers, tokenizer, output_dir: str, every: int = 25, n: int = 100, max_new_tokens: int = 64):
         self.tasks = test_tasks[:n]; self.customers = customers; self.tok = tokenizer
         self.path = os.path.join(output_dir, "eval_metrics.jsonl"); self.every = every; self.max_new_tokens = max_new_tokens
+        self._last_step = -1
 
     def _run(self, model, step):
+        if step == self._last_step: return          # on_step_end and on_train_end both fire at the last step
+        self._last_step = step
         t0 = time.time()
         was_training = model.training
         model.eval()
