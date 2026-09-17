@@ -35,15 +35,21 @@ from trl import GRPOConfig, GRPOTrainer
 
 @dataclass
 class GRPOGradRegConfig(GRPOConfig):
-    grad_reg_strength: float = field(default=0.0, metadata={"help": "λ. 0 disables GR. Paper sweeps ~1e-3..1e-1; 1e-2 is their default."})
+    grad_reg_strength: float = field(default=0.0, metadata={"help": "λ. 0 disables GR. Scale-dependent: pick it by gr/penalty_ratio (see scripts/run_all.py), not by copying the paper."})
     grad_reg_eps: float = field(default=1e-3, metadata={"help": "ε finite-difference step along the normalized gradient."})
     grad_reg_warmup: int = field(default=0, metadata={"help": "Optimizer steps before GR turns on."})
-    grad_reg_g1_clip: float = field(default=10.0, metadata={"help": "Clip ||g1|| used in the estimate (stability)."})
-    grad_reg_g2_clip: float = field(default=10.0, metadata={"help": "Clip ||g2||."})
+    grad_reg_max_ratio: float = field(default=5.0, metadata={"help": "Cap ‖λ·Hg‖ at this multiple of ‖g1‖ (0 = no cap). Applied to the penalty term only, after the estimate is formed, so it never biases the finite difference."})
 
 
 class GRPOTrainerGradReg(GRPOTrainer):
-    """Drop-in GRPOTrainer with optional forward finite-difference gradient regularization."""
+    """Drop-in GRPOTrainer with optional forward finite-difference gradient regularization.
+
+    Note on clipping: an earlier version clipped g1 *before* the finite difference. With the perturbation
+    direction fixed to g1/‖g1‖, scaling g1 by s makes (g2 − s·g1) ≈ (1 − s)·g1 + O(ε) — a spurious term
+    along g1 that dominates whenever the clip engages. In our runs ‖g1‖ was 10–27 against a clip of 10, so
+    the estimator was biased on nearly every step. The estimate is now formed from the raw g1 and only the
+    assembled penalty term is bounded, relative to ‖g1‖.
+    """
 
     def _trainable_params(self, model):
         return [p for p in model.parameters() if p.requires_grad]
@@ -52,13 +58,9 @@ class GRPOTrainerGradReg(GRPOTrainer):
     def _flat_norm(grads) -> torch.Tensor:
         return torch.sqrt(sum((g.float() ** 2).sum() for g in grads))
 
-    @staticmethod
-    def _clip_(grads, norm: torch.Tensor, max_norm: float):
-        if max_norm and norm > max_norm:
-            scale = max_norm / (norm + 1e-12)
-            for g in grads: g.mul_(scale)
-            return norm * scale
-        return norm
+    def _log(self, key, val):
+        mode = "train" if self.model.training else "eval"
+        self._metrics[mode][key].append(float(val))
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         lam = self.args.grad_reg_strength
@@ -71,55 +73,53 @@ class GRPOTrainerGradReg(GRPOTrainer):
         eps = self.args.grad_reg_eps
         accum = self.args.gradient_accumulation_steps
 
-        # ---- g1 = ∇L(θ)
+        # ---- g1 = ∇L(θ), unclipped
         with self.compute_loss_context_manager():
             loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
         g1 = torch.autograd.grad(loss, params, allow_unused=True)
         g1 = [torch.zeros_like(p) if g is None else g.detach() for g, p in zip(g1, params)]
         g1_norm = self._flat_norm(g1)
-        g1_norm_c = self._clip_(g1, g1_norm, self.args.grad_reg_g1_clip)
+        self._log("gr/g1_norm", g1_norm)
 
         if not torch.isfinite(g1_norm) or g1_norm == 0:
-            # Degenerate step: zero (or non-finite) gradient, so there is nothing to regularize.
-            # In GRPO this almost always means every completion in the group got the same reward
-            # (advantage == 0) -- i.e. the reward signal is flat, not that GR failed. Log it loudly.
-            mode = "train" if self.model.training else "eval"
-            self._metrics[mode]["gr/g1_norm"].append(float(g1_norm))
-            self._metrics[mode]["gr/degenerate_steps"].append(1.0)
+            # Zero/non-finite gradient: every completion in the group got the same reward (advantage 0).
+            # Nothing to regularize; log it loudly and fall through to a plain (no-op) step.
+            self._log("gr/degenerate_steps", 1.0)
             for p, g in zip(params, g1):
                 p.grad = g / accum if p.grad is None else p.grad + g / accum
             return loss.detach() / accum
 
-        # ---- θ' = θ + ε · g1/||g1||
-        step = eps / (g1_norm_c + 1e-12)
+        # ---- θ' = θ + ε · g1/‖g1‖ ; g2 = ∇L(θ') on the same sampled completions ; restore θ
+        step = eps / (g1_norm + 1e-12)
         with torch.no_grad():
             for p, g in zip(params, g1): p.add_(g.to(p.dtype), alpha=float(step))
-
-        # ---- g2 = ∇L(θ')   (same sampled completions; compute_loss does not regenerate)
         with self.compute_loss_context_manager():
             loss2 = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
         g2 = torch.autograd.grad(loss2, params, allow_unused=True)
         g2 = [torch.zeros_like(p) if g is None else g.detach() for g, p in zip(g2, params)]
-        g2_norm = self._flat_norm(g2)
-        self._clip_(g2, g2_norm, self.args.grad_reg_g2_clip)
-
-        # ---- restore θ and assemble ∇J ≈ g1 + λ ||g1|| (g2 − g1)/ε
-        coef = lam * float(g1_norm_c) / eps
         with torch.no_grad():
-            for p, a, b in zip(params, g1, g2):
-                p.sub_(a.to(p.dtype), alpha=float(step))
-                grad = (a + coef * (b - a)) / accum
+            for p, g in zip(params, g1): p.sub_(g.to(p.dtype), alpha=float(step))
+        self._log("gr/g2_norm", self._flat_norm(g2))
+
+        # ---- penalty = λ · Hg ≈ λ · ‖g1‖ · (g2 − g1)/ε ; cap relative to ‖g1‖ ; assemble ∇J = g1 + penalty
+        coef = lam * float(g1_norm) / eps
+        pen = [coef * (b - a) for a, b in zip(g1, g2)]
+        pen_norm = self._flat_norm(pen)
+        ratio = float(pen_norm / (g1_norm + 1e-12))
+        cap = self.args.grad_reg_max_ratio
+        clipped = 0.0
+        if cap and ratio > cap:
+            scale = cap / (ratio + 1e-12)
+            for t in pen: t.mul_(scale)
+            clipped = 1.0
+        with torch.no_grad():
+            for p, a, q in zip(params, g1, pen):
+                grad = (a + q) / accum
                 p.grad = grad.to(p.dtype) if p.grad is None else p.grad + grad.to(p.dtype)
 
-        # ---- log
-        mode = "train" if self.model.training else "eval"
-        self._metrics[mode]["gr/g1_norm"].append(float(g1_norm))
-        self._metrics[mode]["gr/g2_norm"].append(float(g2_norm))
-        self._metrics[mode]["gr/degenerate_steps"].append(0.0)
-        pen = float(coef * self._flat_norm([b - a for a, b in zip(g1, g2)]))
-        self._metrics[mode]["gr/penalty_grad_norm"].append(pen)
-        # How much of the update is regularizer vs policy gradient. lambda is scale-dependent, so this
-        # ratio -- not lambda itself -- is the quantity to hold fixed across setups. >> 1 means the
-        # curvature term has swamped the reward signal and the policy barely learns the task.
-        self._metrics[mode]["gr/penalty_ratio"].append(pen / (float(g1_norm_c) + 1e-12))
+        # penalty_ratio is the scale-free knob: ≪1 GR is off, ≫1 the curvature term has swamped the reward signal
+        self._log("gr/degenerate_steps", 0.0)
+        self._log("gr/penalty_grad_norm", pen_norm)
+        self._log("gr/penalty_ratio", ratio)
+        self._log("gr/penalty_capped", clipped)
         return loss.detach() / accum
